@@ -1,4 +1,5 @@
-import Data.List (transpose, intercalate)
+import Data.List (transpose, intercalate, tails)
+import Control.Monad.RWS (All(getAll))
 
 data BoardEntry = O | E | X deriving (Ord, Show)
 type Row = [BoardEntry]
@@ -14,7 +15,6 @@ instance Eq BoardEntry where
     _ == _ = False
 
 -- Simply returns the grid representation which is in row order
-
 rows :: Board -> Board
 rows = id
 
@@ -43,6 +43,9 @@ getCol board index = board !! index
 -- 15 x 15 grid/board size
 gridSize :: Int
 gridSize = 10
+
+depth :: Int
+depth = 5
 
 -- Number of consecutive equivalent enteries needed to meet winning condition
 win :: Int
@@ -90,19 +93,45 @@ validateWin board = validateWinDiagonal board
                     || validateWinHorizontal board
                     || validateWinVertical board
 
-isValidMove :: Board -> Int -> Bool
-isValidMove board index = index <= gridSize -1
-                          && index >= 0
-                          && not (any ((/=E) . (!!index)) board)
+-- checks if the move the player wants to make is valid
+isValid :: Board -> Int -> Bool
+isValid board index = index < gridSize
+                          && 0 <= index
+                          && head (map (!!index) board) /= E
+
+--checks if a specific player has won
+hasWon :: Board -> BoardEntry -> Bool
+hasWon [] _ = False
+hasWon board entry = any (containsWin entry) (getAllSubRows board) ||
+                     any (containsWin entry) (getAllSubRows (transpose board)) ||
+                     any (containsWin entry) (getAllSubRows (allDiagonals board))
+                     where containsWin entry row = all (==entry) row
+
+getAllSubRows :: Board -> [Row]
+getAllSubRows = concatMap getSubRows
+
+getSubRows :: Row -> [Row]
+getSubRows xs = [take win xs' | xs' <- tails xs, length xs' >= win]
 
 possibleMoves :: Board -> BoardEntry -> [Board]
-possibleMoves board entry = [makeMove i entry board | i <- [0..(gridSize-1)] , isValidMove board i]
+possibleMoves board entry = [makeMove i entry board | i <- [0..(gridSize-1)] , isValid board i]
 
 oppositeEntry :: BoardEntry -> BoardEntry
 oppositeEntry O = X
 oppositeEntry X = O
 oppositeEntry E = E
 
+findWinner :: Board -> BoardEntry
+findWinner board | hasWon board O = X
+                 | hasWon board X = O
+                 | otherwise = E
+
+generateTree :: Int -> Board -> BoardEntry -> Tree (Board, Int)
+generateTree 0 board entry = Node (board, depth) []
+generateTree ct board entry | findWinner board == E = Node (board, depth - ct) [generateTree (depth-1) b (oppositeEntry entry) | b <- possibleMoves board entry]
+                            | otherwise = Node (board, depth-ct) []
+
+-- prints the grid to the terminal
 printBoard :: Board -> IO ()
 printBoard board = showBoard $ transpose board
 
