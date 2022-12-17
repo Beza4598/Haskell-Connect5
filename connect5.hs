@@ -1,3 +1,5 @@
+-- Connect5 game in Haskell
+
 import Prelude
 import Data.List (transpose, intercalate, tails)
 import Control.Monad.RWS (All(getAll))
@@ -20,7 +22,6 @@ instance Eq BoardEntry where
 -- Simply returns the grid representation which is in row order
 rows :: Board -> Board
 rows = id
-     
 
 showPlayer :: BoardEntry -> Char
 showPlayer O = 'O'
@@ -43,9 +44,9 @@ allDiagonals xss = diagonals xss ++ diagonals (rotate90 xss)
 getCol :: Board -> Int -> [BoardEntry]
 getCol board index = board !! index
 
--- 15 x 15 grid/board size
 gridSize :: Int
 gridSize = 10
+
 
 depth :: Int
 depth = 5
@@ -72,22 +73,22 @@ dropEntry column entry =
 makeMove :: Int -> BoardEntry -> Board -> Board
 makeMove i entry board =  take i board ++ [dropEntry (getCol board i) entry] ++ drop (i + 1) board
 
--- checks if a list contains five consecutive enteries that are the same and not equal to empty
+-- Checks if a list contains five consecutive enteries that are the same and not equal to empty
 fiveConsecutive :: [BoardEntry] -> Bool
 fiveConsecutive [] = False
 fiveConsecutive (x:xs) = x /= E
                         && take 4 xs == replicate 4 x
                         || fiveConsecutive xs
 
--- checks if a given board has a winner in each column vertically
+-- Checks if a given board has a winner in each column vertically
 validateWinVertical :: Board -> Bool
 validateWinVertical = any fiveConsecutive
 
--- checks if there are any five consecutive enteries horizontally
+-- Checks if there are any five consecutive enteries horizontally
 validateWinHorizontal :: Board -> Bool
 validateWinHorizontal board = any fiveConsecutive $ transpose board
 
--- checks if there are any five consecutive enteries diagonally
+-- Checks if there are any five consecutive enteries diagonally
 validateWinDiagonal :: Board -> Bool
 validateWinDiagonal board = any fiveConsecutive $ allDiagonals board
 
@@ -96,10 +97,10 @@ validateWin board = validateWinDiagonal board
                     || validateWinHorizontal board
                     || validateWinVertical board
 
--- checks if the move the player wants to make is valid
+-- Checks if the move the player wants to make is valid
 isValid :: Board -> Int -> Bool
-isValid board index 
-                    | index < gridSize || 0 <= index = False        
+isValid board index
+                    | index >= gridSize || 0 > index = False
                     | head (map (!!index) board) /= E = False
                     | otherwise = True
 
@@ -121,9 +122,9 @@ getSubRows xs = [take win xs' | xs' <- tails xs, length xs' >= win]
 
 -- Generate a list of next moves
 possibleMoves :: Board -> BoardEntry -> [Board]
-possibleMoves board entry | findWinner board /= E = []
+possibleMoves board entry | isGameOver board = []
                           | otherwise = [makeMove i entry board | i <- [0..(gridSize-1)] , isValid board i]
-                          
+
 -- Check if board is full
 isFull :: Board -> Bool
 isFull = notElem E . concat
@@ -138,6 +139,9 @@ next O = X
 next X = O
 next E = E
 
+isGameOver :: Board -> Bool
+isGameOver board = findWinner board /= E || isDraw board
+
 --If player has won return X
 --If computer has won return O
 --If draw or inconclusive game return E
@@ -146,37 +150,47 @@ findWinner board | hasWon board O = O
                  | hasWon board X = X
                  | otherwise = E
 
+--Determines whose turn it is to play based on symetry of plays
+turn :: Board -> BoardEntry
+turn board = if os <= xs then O else X
+         where
+            os = length (filter (== O) $ concat board)
+            xs = length (filter (== X) $ concat board)
+
 -- Generates a gameSearchTree and prunes to a specfied depth
 -- If a winning board is reached, add board as a leaf in the game tree
-generateTree :: Int -> Board -> BoardEntry -> Tree (Board, Int)
-generateTree 0 board entry = Node (board, depth) []
-generateTree ct board entry = Node (board, depth - ct) [generateTree (depth-1) b (next entry) | b <- possibleMoves board entry]
+generateTree :: Int -> Board -> BoardEntry -> Tree Board
+generateTree 0 board entry = Node board []
+generateTree ct board entry = Node board [generateTree (depth-1) b (next entry) 
+                                          | b <- possibleMoves board entry]
 
-                                
+
 --label leaf nodes with winner
 --propogate evaluation up the game tree
 --If computer is playing take minimum of the children
 --If player is playing take the maximum of the children
 --output tree
-
-minmax :: BoardEntry -> Tree (Board,Int) -> Tree (Board,BoardEntry)
-minmax p (Node (b,d) []) = Node (b, findWinner b) []
-minmax p (Node (b,d) xss) = Node (b, bestEval) xss'
+minmax :: Tree Board -> Tree (Board, BoardEntry)
+minmax (Node b []) = Node (b, findWinner b) []
+minmax (Node b xss)
+    | turn b == O = Node (b, min) xss'
+    | turn b == X = Node (b, max) xss'
+    | otherwise = Node (b, max) xss'
   where
-    xss' = map (minmax (next p)) xss
-    evals = [winnerLabel | Node (_,winnerLabel) _ <- xss']
-    take_max_or_min  = if p==X then maximum else minimum
-    bestEval = take_max_or_min evals
+    xss' = map minmax xss
+    evals = [e' | Node (_,e') _ <- xss']
+    min = minimum evals
+    max = maximum evals
 
 -- Given current board and the computer's entry, generate a gametree
--- Simulate minmax algorithm on the game  tree
+-- Simulate minmax algorithm on the game tree
 -- Randomly  pick one of the direct children of the root  node with the save evaluation
 bestMove :: BoardEntry -> [Row] -> Board
-bestMove entry board = do
-  let tree = generateTree depth board entry
-      Node (_, eval) xss = minmax entry tree
-      possible_moves = [b' | Node (b', e') _ <- xss, e' == eval]  
-      return (head possible_moves)
+bestMove entry board = head best_moves
+      where
+        searchTree = generateTree depth board entry
+        Node (_, e) xss = minmax searchTree
+        best_moves = [b' | Node (b', e') _ <- xss, e' == e]
 
 -- given a gametree labled with 
 -- prints the grid to the terminal
@@ -188,15 +202,32 @@ printBoard board = printBoard' $ transpose board
                 line = replicate gridSize '-'
                 nums = take gridSize ['0'..]
 
+run :: IO()
+run = play initEmptyBoard O
 
--- play :: Board -> BoardEntry -> IO()
--- play board entry = do 
---                    userChoice <- getUserChoice board
---                    pBoard <- makeMove userChoice (next entry) board
+play :: Board -> BoardEntry -> IO()
+play board entry = do
+                   printBoard board
+                   let prompt = "Please enter a column number from 0-9: "
+                   userChoice <- getUserChoice prompt
+                   let pBoard = makeMove userChoice entry board
+                   printBoard pBoard
+                   
+                   if hasWon board entry || isDraw board 
+                    then 
+                      putStrLn "Player has won!"
+                    else 
+                      do 
+                        let cBoard = bestMove (next entry) pBoard
+                        if hasWon board (next entry) || isDraw board 
+                          then 
+                            putStrLn "Computer has won!"
+                          else do
+                            play cBoard entry 
 
 
 getUserChoice :: String -> IO Int
-getUserChoice prompt = do 
+getUserChoice prompt = do
                    putStr "Please enter a column number: "
                    xs <- getLine
                    if xs /= [] && all isDigit xs then
