@@ -1,20 +1,31 @@
 -- Connect5 game in Haskell
 {-# LANGUAGE InstanceSigs #-}
+{-# OPTIONS_GHC -Wno-incomplete-patterns #-}
 
 import Prelude
 import Data.List (transpose, intercalate, tails)
-import Control.Monad.RWS (All(getAll))
 import Data.Bool (Bool (True))
 import Data.Char (isDigit)
-import System.Random
-import System.IO.Unsafe
+import System.Random ( randomRIO ) -- cabal install --lib random
+import System.IO.Unsafe ( unsafePerformIO )
+import Control.DeepSeq (NFData (rnf))
+import Control.Seq (rdeepseq)
+import Control.Parallel.Strategies
+import Control.Monad.Par -- cabal install --lib monad-par
+import GhcPlugins (xFlags)
+import Data.Time.Format.ISO8601 (yearFormat)
 
 data BoardEntry = O | E | X deriving (Ord, Show)
 type Row = [BoardEntry]
 type Board = [Row]
 
 data Tree a = Node a [Tree a]
-                deriving (Show)
+
+instance NFData a => NFData (Tree a) where
+  rnf (Node x ts) = rnf x `seq` rnf ts
+
+instance NFData BoardEntry where
+  rnf x = x `seq` ()
 
 instance Eq BoardEntry where
     (==) :: BoardEntry -> BoardEntry -> Bool
@@ -32,17 +43,6 @@ showPlayer O = 'O'
 showPlayer E = '.'
 showPlayer X = 'X'
 
--- Finds the diagonals of the original grid representation which is in row order
-diagonals :: Board -> Board
-diagonals []       = repeat []
-diagonals (xs:xss) = takeWhile (not . null) $
-    zipWith (++) (map (:[]) xs ++ repeat [])
-                 ([]:diagonals xss)
-
-allDiagonals :: Board -> [Row]
-allDiagonals xss = diagonals (transpose xss) ++ diagonals (rotate90 xss)
-    where rotate90 = reverse
-
 -- Returns a column in the board given at a specific index
 getCol :: Board -> Int -> [BoardEntry]
 getCol board index = board !! index
@@ -56,6 +56,8 @@ depth = 6
 -- Number of consecutive equivalent enteries needed to meet winning condition
 win :: Int
 win = 4
+
+-- Game mechanics --
 
 -- Initializes an empty board
 initEmptyBoard :: Board
@@ -75,37 +77,23 @@ dropEntry column entry =
 makeMove :: Int -> BoardEntry -> Board -> Board
 makeMove i entry board =  take i board ++ [dropEntry (getCol board i) entry] ++ drop (i + 1) board
 
--- Checks if a list contains five consecutive enteries that are the same and not equal to empty
-fiveConsecutive :: [BoardEntry] -> Bool
-fiveConsecutive [] = False
-fiveConsecutive (x:xs) = x /= E
-                        && take 4 xs == replicate 4 x
-                        || fiveConsecutive xs
-
--- Checks if a given board has a winner in each column vertically
-validateWinVertical :: Board -> Bool
-validateWinVertical = any fiveConsecutive
-
--- Checks if there are any five consecutive enteries horizontally
-validateWinHorizontal :: Board -> Bool
-validateWinHorizontal board = any fiveConsecutive $ transpose board
-
--- Checks if there are any five consecutive enteries diagonally
-validateWinDiagonal :: Board -> Bool
-validateWinDiagonal board = any fiveConsecutive $ allDiagonals board
-
-validateWin :: Board -> Bool
-validateWin board = validateWinDiagonal board
-                    || validateWinHorizontal board
-                    || validateWinVertical board
-
-
 -- Checks if the move the player wants to make is valid
 isValid :: Board -> Int -> Bool
 isValid board index
                     | index >= gridSize || 0 > index = False
                     | head (board !! index) /= E = False
                     | otherwise = True
+
+diagonals :: Board -> Board
+diagonals []       = repeat []
+diagonals (xs:xss) = takeWhile (not . null) $
+    zipWith (++) (map (:[]) xs ++ repeat [])
+                 ([]:diagonals xss)
+
+-- Finds the diagonals and anti-diagonals of the original grid representation 
+allDiagonals :: Board -> [Row]
+allDiagonals xss = diagonals (transpose xss) ++ diagonals (rotate90 xss)
+    where rotate90 = reverse
 
 -- Checks if a specific player has won
 hasWon :: Board -> BoardEntry -> Bool
@@ -153,12 +141,16 @@ findWinner board | hasWon board O = O
                  | hasWon board X = X
                  | otherwise = E
 
---Determines whose turn it is to play based on symetry of plays
-turn :: Board -> BoardEntry
-turn board = if os <= xs then O else X
-         where
-            os = length (filter (== O) $ concat board)
-            xs = length (filter (== X) $ concat board)
+
+
+-- Faster versions of minimum and maximum t
+minimum' :: [BoardEntry] -> BoardEntry
+minimum' = foldr1 (\x y -> if x == O || y == O then X else min x y)
+
+maximum' :: [BoardEntry] -> BoardEntry
+maximum' = foldr1 (\x y -> if x == X || y == X then X else max x y)
+
+-- Game logic (AI) ---
 
 -- Generates a gameSearchTree and prunes to a specfied depth
 -- If a winning board is reached, add board as a leaf in the game tree
@@ -170,25 +162,47 @@ prune :: Int -> Tree Board -> Tree Board
 prune 0 (Node x _)  = Node x []
 prune n (Node x ts) = Node x [prune (n-1) t | t <- ts]
 
---label leaf nodes with winner
---propogate evaluation up the game tree
---If computer is playing take minimum of the children
---If player is playing take the maximum of the children
---output tree
-
+-- X is maximizing
+-- O is minimizing
 isMaximizing :: BoardEntry -> Bool
 isMaximizing entry
             | entry == O = False
             | entry == X = True
 
-minmax :: BoardEntry -> Tree Board -> Tree (Board, BoardEntry)
+--naive minimax algorithm
+--labels leaf nodes with winner
+--propogates evaluation up the game tree
+--If computer is playing take minimum of the children
+--If player is playing take the maximum of the children
+--output tree
+minmax ::  BoardEntry -> Tree Board -> Tree (Board, BoardEntry)
 minmax entry (Node b []) = Node (b, findWinner b) []
-minmax entry (Node b xss)
-    | isMaximizing entry = Node (b, maximum evals) xss'
-    | not (isMaximizing entry) = Node (b, minimum evals) xss'
+minmax entry (Node b xss) = Node (b, evaluate evals) xss'
         where
-          xss' = map (minmax (next entry)) xss
+          xss' = map (minmax (nextEntry entry)) xss
           evals = [e' | Node (_,e') _ <- xss']
+          evaluate = if isMaximizing entry then maximum else minimum
+
+-- Parallelizes by using a strategy (parList rdeepseq) to evaluate the tree in chunks equal to the 
+-- Number of possible moves from the root tree
+minmaxPar :: BoardEntry -> Tree Board -> Tree (Board, BoardEntry)
+minmaxPar entry (Node b []) = Node (b, findWinner b) []
+minmaxPar entry (Node b xss) = Node (b, evaluate evals) xss'
+        where
+          xss' = map (minmax (nextEntry entry)) xss `using` parList Control.Parallel.Strategies.rdeepseq
+          evals = [e' | Node (_,e') _ <- xss']
+          evaluate = if isMaximizing entry then maximum else minimum
+
+
+-- Parallelizes by applying parMap to evaluate the tree in chunks equal to the 
+-- Number of possible moves from the root tree
+minmaxParTwo :: BoardEntry -> Tree Board -> Tree (Board, BoardEntry)
+minmaxParTwo entry (Node b []) = runPar $ return $ Node (b, findWinner b) []
+minmaxParTwo entry (Node b xss) = runPar $ do
+        xss' <- Control.Monad.Par.parMap (minmax (nextEntry entry)) xss
+        let evals = [p | Node (_, p) _ <- xss']
+        let evaluate = if isMaximizing entry then maximum else minimum
+        return $ Node (b, evaluate evals) xss'
 
 -- Given current board and the computer's entry, generate a gametree
 -- Simulate minmax algorithm on the game tree
@@ -201,6 +215,9 @@ bestMove entry board = best_moves !! random
         best_moves = [b' | Node (b', e') _ <- xss, e' == best]
         random  = unsafePerformIO (randomRIO (0,length best_moves -1))
 
+
+-- Utility Functions --
+
 -- given a gametree labled with 
 -- prints the grid to the terminal
 printBoard :: Board -> IO ()
@@ -212,49 +229,47 @@ printBoard board = printBoard' $ transpose board
                 nums = take gridSize ['0'..]
 
 run :: IO()
-run = play initEmptyBoard O
+run = printBoard $ bestMove X initEmptyBoard
 
-play :: Board -> BoardEntry -> IO()
-play board entry = do
+gameLoop :: Board -> BoardEntry -> IO()
+gameLoop board entry = do
                    printBoard board
                    let prompt = "Please enter a column number from 0-9: "
                    userChoice <- getUserChoice board prompt
                    let pBoard = makeMove userChoice entry board
                    printBoard pBoard
 
-                   if hasWon board entry || isDraw board
+                   if isGameOver pBoard
                     then
                       putStrLn "Player has won!"
                     else
                       do
                         let cBoard = bestMove (nextEntry entry) pBoard
-                        if hasWon board (nextEntry entry) || isDraw board
-                          then
+                        if isGameOver cBoard
+                          then do
+                            printBoard cBoard
                             putStrLn "Computer has won!"
                           else do
-                            play cBoard entry
+                            gameLoop cBoard entry
 
-play' :: Board -> BoardEntry -> IO()
-play' board entry = do
+simulate :: Board -> BoardEntry -> IO()
+simulate board entry = do
                    printBoard board
-                   let prompt = "P1: Please enter a column number from 0-9: "
-                   userChoice <- getUserChoice board prompt
-                   let pBoard = makeMove userChoice entry board
-                   printBoard pBoard
+                   let cBoard_one = bestMove entry board
+                   printBoard cBoard_one
 
-                   if not isGameOver
+                   if isGameOver cBoard_one
                     then
-                      putStrLn "Player has won!"
+                      putStrLn "Computer 1 has won!"
                     else
                       do
-                        let prompt = "P2: Please enter a column number from 0-9: "
-                        userChoicetwo <- getUserChoice board prompt
-                        let ptBoard = makeMove userChoicetwo (nextEntry entry) pBoard
-                        if not isGameOver
-                          then
-                            putStrLn "Computer has won!"
+                        let cBoard = bestMove (nextEntry entry) cBoard_one
+                        if isGameOver cBoard
+                          then do
+                            printBoard cBoard
+                            putStrLn "Computer 2 has won!"
                           else do
-                            play' ptBoard entry
+                            simulate cBoard entry
 
 getUserChoice :: Board -> String -> IO Int
 getUserChoice board prompt = do
@@ -265,3 +280,7 @@ getUserChoice board prompt = do
                    else
                       do putStrLn "ERROR: Invalid number"
                          getUserChoice board prompt
+
+--start program when executed
+main :: IO()
+main = run
