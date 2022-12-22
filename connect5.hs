@@ -3,26 +3,20 @@
 {-# OPTIONS_GHC -Wno-incomplete-patterns #-}
 
 import Prelude
-import Data.List (transpose, intercalate, tails)
-import Data.Bool (Bool (True))
+import Data.List (transpose, tails)
+import Data.Bool ()
 import Data.Char (isDigit)
 import System.Random ( randomRIO ) -- cabal install --lib random
 import System.IO.Unsafe ( unsafePerformIO )
 import Control.DeepSeq (NFData (rnf))
-import Control.Seq (rdeepseq)
 import Control.Parallel.Strategies
-import Control.Monad.Par -- cabal install --lib monad-par
-import GhcPlugins (xFlags)
-import Data.Time.Format.ISO8601 (yearFormat)
+    ( parList, rdeepseq, using ) 
+import Control.Monad.Par ( runPar, parMap ) -- cabal install --lib monad-par
+import Data.Tree
 
 data BoardEntry = O | E | X deriving (Ord, Show)
-type Row = [BoardEntry]
-type Board = [Row]
-
-data Tree a = Node a [Tree a]
-
-instance NFData a => NFData (Tree a) where
-  rnf (Node x ts) = rnf x `seq` rnf ts
+type Column = [BoardEntry]
+type Board = [Column]
 
 instance NFData BoardEntry where
   rnf x = x `seq` ()
@@ -34,9 +28,15 @@ instance Eq BoardEntry where
     E == E = True
     _ == _ = False
 
--- Simply returns the grid representation which is in row order
-rows :: Board -> Board
-rows = id
+
+mode :: [Char]
+mode = "par2"
+
+ifMode :: [Char] -> BoardEntry -> Tree Board -> Tree (Board, BoardEntry)
+ifMode "seq" = minmax
+ifMode "par1" = minmaxPar
+ifMode "par2" = minmaxParTwo
+
 
 showPlayer :: BoardEntry -> Char
 showPlayer O = 'O'
@@ -91,25 +91,26 @@ diagonals (xs:xss) = takeWhile (not . null) $
                  ([]:diagonals xss)
 
 -- Finds the diagonals and anti-diagonals of the original grid representation 
-allDiagonals :: Board -> [Row]
+allDiagonals :: Board -> [Column]
 allDiagonals xss = diagonals (transpose xss) ++ diagonals (rotate90 xss)
     where rotate90 = reverse
 
+
 -- Checks if a specific player has won
 hasWon :: Board -> BoardEntry -> Bool
-hasWon [] _ = False
-hasWon board entry = any (containsWin entry) (getAllSubRows board) ||
-                     any (containsWin entry) (getAllSubRows (transpose board)) ||
-                     any (containsWin entry) (getAllSubRows (allDiagonals board))
-                     where containsWin entry row = all (==entry) row
+hasWon board entry = any (all (==entry)) (rows ++ cols ++ diags)
+  where
+    rows = winChunks board
+    cols = winChunks (transpose board)
+    diags = winChunks (allDiagonals board)
 
 -- returns all sub rows for each row in the grid representation of the board
-getAllSubRows :: Board -> [Row]
-getAllSubRows = concatMap getSubRows
+winChunks :: Board -> [Column]
+winChunks = concatMap slidingWindow
 
 -- Returns every subset of consecutive elements in a list the size of the winning condition
-getSubRows :: Row -> [Row]
-getSubRows xs = [take win xs' | xs' <- tails xs, length xs' >= win]
+slidingWindow :: Column -> [Column]
+slidingWindow xs = [take win xs' | xs' <- tails xs, length xs' >= win]
 
 -- Generate a list of nextEntry moves
 possibleMoves :: Board -> BoardEntry -> [Board]
@@ -143,13 +144,6 @@ findWinner board | hasWon board O = O
 
 
 
--- Faster versions of minimum and maximum t
-minimum' :: [BoardEntry] -> BoardEntry
-minimum' = foldr1 (\x y -> if x == O || y == O then X else min x y)
-
-maximum' :: [BoardEntry] -> BoardEntry
-maximum' = foldr1 (\x y -> if x == X || y == X then X else max x y)
-
 -- Game logic (AI) ---
 
 -- Generates a gameSearchTree and prunes to a specfied depth
@@ -176,7 +170,7 @@ isMaximizing entry
 --If player is playing take the maximum of the children
 --output tree
 minmax ::  BoardEntry -> Tree Board -> Tree (Board, BoardEntry)
-minmax entry (Node b []) = Node (b, findWinner b) []
+minmax _ (Node b []) = Node (b, findWinner b) []
 minmax entry (Node b xss) = Node (b, evaluate evals) xss'
         where
           xss' = map (minmax (nextEntry entry)) xss
@@ -186,10 +180,10 @@ minmax entry (Node b xss) = Node (b, evaluate evals) xss'
 -- Parallelizes by using a strategy (parList rdeepseq) to evaluate the tree in chunks equal to the 
 -- Number of possible moves from the root tree
 minmaxPar :: BoardEntry -> Tree Board -> Tree (Board, BoardEntry)
-minmaxPar entry (Node b []) = Node (b, findWinner b) []
+minmaxPar _ (Node b []) = Node (b, findWinner b) []
 minmaxPar entry (Node b xss) = Node (b, evaluate evals) xss'
         where
-          xss' = map (minmax (nextEntry entry)) xss `using` parList Control.Parallel.Strategies.rdeepseq
+          xss' = map (minmax (nextEntry entry)) xss `using` parList rdeepseq
           evals = [e' | Node (_,e') _ <- xss']
           evaluate = if isMaximizing entry then maximum else minimum
 
@@ -197,9 +191,9 @@ minmaxPar entry (Node b xss) = Node (b, evaluate evals) xss'
 -- Parallelizes by applying parMap to evaluate the tree in chunks equal to the 
 -- Number of possible moves from the root tree
 minmaxParTwo :: BoardEntry -> Tree Board -> Tree (Board, BoardEntry)
-minmaxParTwo entry (Node b []) = runPar $ return $ Node (b, findWinner b) []
+minmaxParTwo _ (Node b []) = runPar $ return $ Node (b, findWinner b) []
 minmaxParTwo entry (Node b xss) = runPar $ do
-        xss' <- Control.Monad.Par.parMap (minmax (nextEntry entry)) xss
+        xss' <- parMap (minmax (nextEntry entry)) xss
         let evals = [p | Node (_, p) _ <- xss']
         let evaluate = if isMaximizing entry then maximum else minimum
         return $ Node (b, evaluate evals) xss'
@@ -207,11 +201,11 @@ minmaxParTwo entry (Node b xss) = runPar $ do
 -- Given current board and the computer's entry, generate a gametree
 -- Simulate minmax algorithm on the game tree
 -- Randomly  pick one of the direct children of the root  node with the save evaluation
-bestMove :: BoardEntry -> [Row] -> Board
+bestMove :: BoardEntry -> [Column] -> Board
 bestMove entry board = best_moves !! random
       where
         gametree = prune depth (generateTree board entry)
-        Node (_, best) xss = minmax entry gametree
+        Node (_, best) xss = ifMode mode entry gametree
         best_moves = [b' | Node (b', e') _ <- xss, e' == best]
         random  = unsafePerformIO (randomRIO (0,length best_moves -1))
 
@@ -229,26 +223,27 @@ printBoard board = printBoard' $ transpose board
                 nums = take gridSize ['0'..]
 
 run :: IO()
-run = printBoard $ bestMove X initEmptyBoard
+run = gameLoop initEmptyBoard O
 
 gameLoop :: Board -> BoardEntry -> IO()
 gameLoop board entry = do
-                   printBoard board
-                   let prompt = "Please enter a column number from 0-9: "
+                   let prompt = "Please enter a column number from 0-6: \n"
                    userChoice <- getUserChoice board prompt
                    let pBoard = makeMove userChoice entry board
+                   
                    printBoard pBoard
 
                    if isGameOver pBoard
-                    then
-                      putStrLn "Player has won!"
+                    then do 
+                      putStrLn "Player has won!\n"
                     else
                       do
+                        putStrLn "Computer is processing next move ...\n"
                         let cBoard = bestMove (nextEntry entry) pBoard
+                        printBoard cBoard
                         if isGameOver cBoard
                           then do
-                            printBoard cBoard
-                            putStrLn "Computer has won!"
+                            putStrLn "Computer has won!\n"
                           else do
                             gameLoop cBoard entry
 
